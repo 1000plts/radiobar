@@ -2,6 +2,10 @@
 
 A minimal macOS menu bar internet radio player.
 
+
+
+
+
 ![menubar](https://img.shields.io/badge/macOS-Apple%20Silicon-black) ![python](https://img.shields.io/badge/built%20with-Python%20%2B%20PyObjC-blue)
 
 ## Features
