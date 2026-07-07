@@ -1,7 +1,11 @@
+
+
+
 # RadioBar
 
 A minimal macOS menu bar internet radio player.
 
+https://github.com/user-attachments/assets/9dee7f4e-6d05-4d1e-9510-823c9587af5d
 
 
 
