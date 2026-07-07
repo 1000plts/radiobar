@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+RadioBar — a minimal macOS menubar internet radio player.
+Requires: rumps, pyobjc (AppKit + AVFoundation). Audio plays via AVPlayer —
+no external apps needed.
+"""
+
+import json
+import os
+import socket
+import ssl
+import threading
+import time
+import urllib.request
+from urllib.parse import urlparse
+import rumps
+import objc
+import AppKit
+import AVFoundation
+
+CONFIG_PATH = os.path.expanduser("~/.radio_bar_config.json")
+
+DEFAULT_STATIONS = [
+    {"name": "NTS 1",          "url": "https://stream-relay-geo.ntslive.net/stream"},
+    {"name": "NTS 2",          "url": "https://stream-relay-geo.ntslive.net/stream2"},
+    {"name": "NTS Expansions", "url": "https://stream-mixtape-geo.ntslive.net/mixtape3"},
+    {"name": "NTS Island time","url": "https://stream-mixtape-geo.ntslive.net/mixtape21"},
+    {"name": "NOODS",          "url": "https://noods-radio.radiocult.fm/stream"},
+    {"name": "Cashmere",       "url": "https://cashmereradio.out.airtime.pro:8000/cashmereradio_b"},
+    {"name": "TOK FM",         "url": "https://radiostream.pl/tuba10-1.mp3"},
+    {"name": "PR 1",           "url": "http://mp3.polskieradio.pl:8904/;"},
+    {"name": "PR 2",           "url": "http://mp3.polskieradio.pl:8952/;"},
+]
+
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"stations": DEFAULT_STATIONS}
+
+
+def save_config(config):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+MAX_STATIONS = 10
+STATION_ROW_TYPE = "com.radiobar.station-row"  # pasteboard type for drag-reorder
+
+MARQUEE_WIDTH = 24      # visible characters in the menubar title
+MARQUEE_STEP_SECS = 0.4
+MARQUEE_GAP = "   "     # spacing between end and wrapped-around start
+
+
+def marquee_window(text, offset, width=MARQUEE_WIDTH):
+    """Fixed-width sliding window over text; returns text as-is if it fits."""
+    if len(text) <= width:
+        return text
+    looped = text + MARQUEE_GAP
+    doubled = looped + looped
+    start = offset % len(looped)
+    return doubled[start:start + width]
+
+
+NTS_LIVE_API = "https://www.nts.live/api/v2/live"
+NTS_CHANNELS = {
+    "https://stream-relay-geo.ntslive.net/stream": "1",
+    "https://stream-relay-geo.ntslive.net/stream2": "2",
+}
+
+
+def nts_channel_for(url):
+    """Return the NTS live channel ('1'/'2') for a stream URL, else None."""
+    return NTS_CHANNELS.get(url.rstrip("/"))
+
+
+def fetch_icy_title(url, timeout=6):
+    """Read the current ICY StreamTitle from an internet radio stream.
+
+    Speaks both HTTP and the legacy 'ICY 200 OK' Shoutcast dialect (which
+    urllib rejects). Downloads one metadata interval (~16 KB) then closes.
+    Returns the title string or None.
+    """
+    try:
+        parts = urlparse(url)
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            if parts.scheme == "https":
+                sock = ssl.create_default_context().wrap_socket(
+                    sock, server_hostname=host
+                )
+            request = (
+                f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
+                "Icy-MetaData: 1\r\nUser-Agent: RadioBar\r\n\r\n"
+            )
+            sock.sendall(request.encode())
+            stream = sock.makefile("rb")
+            if b"200" not in stream.readline():
+                return None
+            metaint = None
+            while True:
+                line = stream.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                if line.lower().startswith(b"icy-metaint:"):
+                    metaint = int(line.split(b":", 1)[1].strip())
+            if not metaint or metaint > 512 * 1024:
+                return None
+            stream.read(metaint)               # skip one interval of audio
+            length = stream.read(1)[0] * 16    # metadata block length
+            if length == 0:
+                return None
+            block = stream.read(length).rstrip(b"\x00").decode("utf-8", "replace")
+            for part in block.split(";"):
+                if part.startswith("StreamTitle='"):
+                    return part[len("StreamTitle='"):].rstrip("'") or None
+            return None
+        finally:
+            sock.close()
+    except Exception:
+        return None
+
+
+def fetch_nts_now(channel):
+    """Fetch the current broadcast title for an NTS channel. Returns str or None."""
+    try:
+        with urllib.request.urlopen(NTS_LIVE_API, timeout=5) as resp:
+            data = json.load(resp)
+        for ch in data.get("results", []):
+            if str(ch.get("channel_name")) == channel:
+                title = (ch.get("now") or {}).get("broadcast_title")
+                return title or None
+    except Exception:
+        pass
+    return None
+
+
+class StationsPanelController(AppKit.NSObject):
+    """Native 'Manage Stations' panel: station list, − to remove, fields + Add."""
+
+    def initWithApp_(self, app):
+        self = objc.super(StationsPanelController, self).init()
+        if self is None:
+            return None
+        self.app = app
+        self.panel = None
+        return self
+
+    def show(self):
+        if self.panel is None:
+            self._build_panel()
+        self._reload()
+        self.panel.center()
+        self.panel.makeKeyAndOrderFront_(None)
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+
+    # ── UI construction ────────────────────────────────────────────────────
+
+    def _build_panel(self):
+        style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable
+        self.panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            AppKit.NSMakeRect(0, 0, 460, 340), style, AppKit.NSBackingStoreBuffered, False
+        )
+        self.panel.setTitle_("Manage Stations")
+        self.panel.setFloatingPanel_(True)
+        self.panel.setReleasedWhenClosed_(False)
+        content = self.panel.contentView()
+
+        self.table = AppKit.NSTableView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 420, 204))
+        for identifier, title, width in (("name", "Name", 120), ("url", "URL", 280)):
+            col = AppKit.NSTableColumn.alloc().initWithIdentifier_(identifier)
+            col.setTitle_(title)
+            col.setWidth_(width)
+            col.setEditable_(False)
+            self.table.addTableColumn_(col)
+        self.table.setDataSource_(self)
+        self.table.setAllowsMultipleSelection_(False)
+        self.table.registerForDraggedTypes_([STATION_ROW_TYPE])
+        self.table.setDraggingSourceOperationMask_forLocal_(AppKit.NSDragOperationMove, True)
+
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(20, 116, 420, 204))
+        scroll.setDocumentView_(self.table)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setBorderType_(AppKit.NSBezelBorder)
+        content.addSubview_(scroll)
+
+        minus = AppKit.NSButton.buttonWithTitle_target_action_("−", self, "removeClicked:")
+        minus.setFrame_(AppKit.NSMakeRect(20, 84, 32, 24))
+        content.addSubview_(minus)
+
+        self.count_label = AppKit.NSTextField.labelWithString_("")
+        self.count_label.setFrame_(AppKit.NSMakeRect(300, 88, 140, 17))
+        self.count_label.setAlignment_(AppKit.NSTextAlignmentRight)
+        self.count_label.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+        content.addSubview_(self.count_label)
+
+        self.name_field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(20, 40, 140, 24))
+        self.name_field.setPlaceholderString_("Name")
+        self.name_field.setDelegate_(self)
+        content.addSubview_(self.name_field)
+
+        self.url_field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(168, 40, 200, 24))
+        self.url_field.setPlaceholderString_("Stream URL")
+        self.url_field.setDelegate_(self)
+        self.url_field.setTarget_(self)
+        self.url_field.setAction_("addClicked:")  # Return key adds
+        content.addSubview_(self.url_field)
+
+        self.add_button = AppKit.NSButton.buttonWithTitle_target_action_("Add", self, "addClicked:")
+        self.add_button.setFrame_(AppKit.NSMakeRect(376, 36, 64, 32))
+        content.addSubview_(self.add_button)
+
+    # ── State ──────────────────────────────────────────────────────────────
+
+    def _stations(self):
+        return self.app.config.get("stations", [])
+
+    def _reload(self):
+        self.table.reloadData()
+        self.count_label.setStringValue_(f"{len(self._stations())} / {MAX_STATIONS} stations")
+        self._update_add_enabled()
+
+    def _update_add_enabled(self):
+        name = self.name_field.stringValue().strip()
+        url = self.url_field.stringValue().strip()
+        ok = bool(name) and bool(url) and len(self._stations()) < MAX_STATIONS
+        self.add_button.setEnabled_(ok)
+
+    # ── Actions ────────────────────────────────────────────────────────────
+
+    def addClicked_(self, sender):
+        name = self.name_field.stringValue().strip()
+        url = self.url_field.stringValue().strip()
+        if not name or not url or len(self._stations()) >= MAX_STATIONS:
+            AppKit.NSBeep()
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            AppKit.NSBeep()
+            self.url_field.setStringValue_(url)
+            return
+        stations = self._stations()
+        stations.append({"name": name, "url": url})
+        self.app.config["stations"] = stations
+        save_config(self.app.config)
+        self.app._build_menu()
+        self.name_field.setStringValue_("")
+        self.url_field.setStringValue_("")
+        self._reload()
+        self.panel.makeFirstResponder_(self.name_field)
+
+    def removeClicked_(self, sender):
+        row = self.table.selectedRow()
+        if row < 0:
+            AppKit.NSBeep()
+            return
+        stations = self._stations()
+        removed = stations.pop(row)
+        if self.app.current_station is removed:
+            self.app.stop(None)
+        self.app.config["stations"] = stations
+        save_config(self.app.config)
+        self.app._build_menu()
+        self._reload()
+
+    # ── NSTableView data source ────────────────────────────────────────────
+
+    def numberOfRowsInTableView_(self, table):
+        return len(self._stations())
+
+    def tableView_objectValueForTableColumn_row_(self, table, column, row):
+        station = self._stations()[row]
+        return station["name"] if column.identifier() == "name" else station["url"]
+
+    # ── Drag-and-drop reordering ───────────────────────────────────────────
+
+    def tableView_pasteboardWriterForRow_(self, table, row):
+        item = AppKit.NSPasteboardItem.alloc().init()
+        item.setString_forType_(str(row), STATION_ROW_TYPE)
+        return item
+
+    def tableView_validateDrop_proposedRow_proposedDropOperation_(self, table, info, row, operation):
+        if operation == AppKit.NSTableViewDropOn:
+            table.setDropRow_dropOperation_(row, AppKit.NSTableViewDropAbove)
+        return AppKit.NSDragOperationMove
+
+    def tableView_acceptDrop_row_dropOperation_(self, table, info, row, operation):
+        value = info.draggingPasteboard().stringForType_(STATION_ROW_TYPE)
+        if value is None:
+            return False
+        source = int(value)
+        stations = self._stations()
+        if not (0 <= source < len(stations)):
+            return False
+        moved = stations.pop(source)
+        dest = row - 1 if source < row else row
+        stations.insert(dest, moved)
+        self.app.config["stations"] = stations
+        save_config(self.app.config)
+        self.app._build_menu()
+        self._reload()
+        return True
+
+    # ── NSTextField delegate ───────────────────────────────────────────────
+
+    def controlTextDidChange_(self, notification):
+        self._update_add_enabled()
+
+
+class StatusClickHandler(AppKit.NSObject):
+    """Routes menubar clicks: left toggles play/pause, right opens the menu."""
+
+    def initWithApp_(self, app):
+        self = objc.super(StatusClickHandler, self).init()
+        if self is None:
+            return None
+        self.app = app
+        return self
+
+    def statusClicked_(self, sender):
+        event = AppKit.NSApp.currentEvent()
+        right_click = event is not None and (
+            event.type() == AppKit.NSEventTypeRightMouseUp
+            or (event.modifierFlags() & AppKit.NSEventModifierFlagControl)
+        )
+        if right_click or not self.app.current_station:
+            self.app.pop_menu()
+        else:
+            self.app.toggle_pause(None)
+
+
+class RadioBarApp(rumps.App):
+    def __init__(self):
+        super().__init__("RadioBar", quit_button=None)
+        AppKit.NSApplication.sharedApplication().setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+        self.stations_panel = None
+        self.config = load_config()
+        self.player = None
+        self.current_station = None
+        self.paused = False
+        self.meta_timer = None
+        self._nts_cache = {"time": 0.0, "label": None}
+        self._icy_cache = {"time": 0.0, "label": None}
+        self.marquee_prefix = "RadioBar"   # static: play state + station name
+        self.marquee_scroll = ""        # scrolling: current show/track title
+        self.marquee_offset = 0
+        self.marquee_timer = rumps.Timer(self._tick_marquee, MARQUEE_STEP_SECS)
+        self._fixed_length = None  # pixel width of the playing-state status item
+        self._now_label = None
+        self._click_handler = None
+        self._rewire_timer = rumps.Timer(self._rewire_status_click, 0.5)
+        self._rewire_timer.start()
+        self._build_menu()
+
+    # ── Menubar click handling ─────────────────────────────────────────────
+
+    def _rewire_status_click(self, timer):
+        """One-shot after launch: detach the menu so clicks reach us directly."""
+        timer.stop()
+        try:
+            statusitem = self._nsapp.nsstatusitem
+            statusitem.setMenu_(None)
+            button = statusitem.button()
+            self._click_handler = StatusClickHandler.alloc().initWithApp_(self)
+            button.setTarget_(self._click_handler)
+            button.setAction_("statusClicked:")
+            button.sendActionOn_(
+                AppKit.NSEventMaskLeftMouseUp | AppKit.NSEventMaskRightMouseUp
+            )
+        except Exception:
+            pass  # fall back to default click-opens-menu behavior
+
+    def pop_menu(self):
+        """Show the dropdown menu programmatically (used for right-click)."""
+        statusitem = self._nsapp.nsstatusitem
+        statusitem.setMenu_(self.menu._menu)
+        statusitem.button().performClick_(None)
+        statusitem.setMenu_(None)
+
+    def _update_marquee_from_state(self):
+        if not self.current_station:
+            prefix, scroll = "RadioBar", ""
+        else:
+            # ︎ forces text (not emoji) glyphs so both icons render same-width
+            icon = "⏸︎" if self.paused else "▶︎"
+            prefix = f"{icon} {self.current_station['name']}"
+            scroll = self._now_label or ""
+            if scroll:
+                prefix += " · "
+        # May be called from the metadata poll thread; timer + AppKit need main.
+        AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(
+            lambda: self._set_marquee(prefix, scroll)
+        )
+
+    # ── Menubar title marquee ──────────────────────────────────────────────
+
+    def _set_marquee(self, prefix, scroll):
+        """Set the menubar text; only the scroll part slides, prefix stays put."""
+        if (prefix, scroll) != (self.marquee_prefix, self.marquee_scroll):
+            self.marquee_prefix = prefix
+            self.marquee_scroll = scroll
+            self.marquee_offset = 0
+        if len(scroll) > self._scroll_width():
+            if not self.marquee_timer.is_alive():
+                self.marquee_timer.start()
+        else:
+            if self.marquee_timer.is_alive():
+                self.marquee_timer.stop()
+        self._render_title()
+
+    def _scroll_width(self):
+        """Characters left for the scrolling title after the static prefix."""
+        return max(6, MARQUEE_WIDTH - len(self.marquee_prefix))
+
+    def _tick_marquee(self, _timer):
+        self.marquee_offset += 1
+        self._render_title()
+
+    def _render_title(self):
+        text = self.marquee_prefix + marquee_window(
+            self.marquee_scroll, self.marquee_offset, self._scroll_width()
+        )
+        playing = self.current_station is not None
+        if playing:
+            text = text.ljust(MARQUEE_WIDTH)  # constant char count while playing
+        try:
+            # Monospaced font keeps the sliding window a truly fixed width.
+            font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(
+                13, AppKit.NSFontWeightRegular
+            )
+            attributed = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                text, {AppKit.NSFontAttributeName: font}
+            )
+            statusitem = self._nsapp.nsstatusitem
+            button = statusitem.button()
+            button.setAlignment_(AppKit.NSTextAlignmentLeft)
+            button.setAttributedTitle_(attributed)
+            if playing:
+                if self._fixed_length is None:
+                    # Measure the widest possible window once; +10 for padding.
+                    sample = AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                        "M" * MARQUEE_WIDTH, {AppKit.NSFontAttributeName: font}
+                    )
+                    self._fixed_length = sample.size().width + 10
+                statusitem.setLength_(self._fixed_length)
+            else:
+                statusitem.setLength_(AppKit.NSVariableStatusItemLength)
+        except Exception:
+            self.title = text  # fallback: plain proportional title
+
+    # ── Menu construction ──────────────────────────────────────────────────
+
+    def _build_menu(self):
+        self.menu.clear()
+        stations = self.config.get("stations", [])[:10]
+
+        self.now_playing_item = rumps.MenuItem("—", callback=None)
+        self.menu.add(self.now_playing_item)
+        self.menu.add(rumps.MenuItem("⏸  Pause / Resume", callback=self.toggle_pause))
+        self.menu.add(rumps.MenuItem("⏹  Stop", callback=self.stop))
+        self.menu.add(rumps.separator)
+
+        for station in stations:  # config order == menu order (reorder in panel)
+            item = rumps.MenuItem(
+                station["name"],
+                callback=self._make_play_cb(station)
+            )
+            self.menu.add(item)
+        self.menu.add(rumps.separator)
+        self.menu.add(rumps.MenuItem("⚙️  Configure stations…", callback=self.open_config))
+        self.menu.add(rumps.MenuItem("Quit RadioBar", callback=rumps.quit_application))
+
+    def _make_play_cb(self, station):
+        def cb(_):
+            self.play(station)
+        return cb
+
+    # ── Playback ───────────────────────────────────────────────────────────
+
+    def play(self, station):
+        self.stop(None)
+        self.current_station = station
+        self.paused = False
+        self._nts_cache = {"time": 0.0, "label": None}
+        self._icy_cache = {"time": 0.0, "label": None}
+        self._now_label = None
+        self._update_marquee_from_state()
+        self.now_playing_item.title = "Connecting…"
+
+        url = AppKit.NSURL.URLWithString_(station["url"])
+        self.player = AVFoundation.AVPlayer.playerWithURL_(url)
+        self.player.play()
+
+        self._start_meta_polling()
+
+    def toggle_pause(self, _):
+        if not self.player or not self.current_station:
+            return
+        if self.paused:
+            self.player.play()
+            self.paused = False
+        else:
+            self.player.pause()
+            self.paused = True
+        self._update_marquee_from_state()
+
+    def stop(self, _):
+        self._stop_meta_polling()
+        if self.player:
+            self.player.pause()
+            self.player.replaceCurrentItemWithPlayerItem_(None)
+            self.player = None
+        self.current_station = None
+        self.paused = False
+        self._now_label = None
+        self._update_marquee_from_state()
+        self.now_playing_item.title = "—"
+
+    # ── Metadata polling ───────────────────────────────────────────────────
+
+    def _start_meta_polling(self):
+        self._stop_meta_polling()
+        self._poll_meta()
+
+    def _stop_meta_polling(self):
+        if self.meta_timer:
+            self.meta_timer.cancel()
+            self.meta_timer = None
+
+    def _poll_meta(self):
+        if not self.player:
+            return
+        label = self._nts_label()
+        if label is None:
+            label = self._icy_label()
+        self._now_label = label
+        self.now_playing_item.title = f"♫  {label}" if label else "♫  Playing"
+        self._update_marquee_from_state()
+
+        self.meta_timer = threading.Timer(10.0, self._poll_meta)
+        self.meta_timer.daemon = True
+        self.meta_timer.start()
+
+    def _nts_label(self):
+        """Current NTS show title if playing an NTS live channel, else None."""
+        if not self.current_station:
+            return None
+        channel = nts_channel_for(self.current_station["url"])
+        if not channel:
+            return None
+        if time.monotonic() - self._nts_cache["time"] > 60:
+            self._nts_cache["label"] = fetch_nts_now(channel)
+            self._nts_cache["time"] = time.monotonic()
+        return self._nts_cache["label"]
+
+    def _icy_label(self):
+        """Track info from the stream's ICY metadata (cached 30s), or None."""
+        if not self.current_station:
+            return None
+        if time.monotonic() - self._icy_cache["time"] > 30:
+            self._icy_cache["label"] = fetch_icy_title(self.current_station["url"])
+            self._icy_cache["time"] = time.monotonic()
+        return self._icy_cache["label"]
+
+    # ── Config panel ───────────────────────────────────────────────────────
+
+    def open_config(self, _):
+        if self.stations_panel is None:
+            self.stations_panel = StationsPanelController.alloc().initWithApp_(self)
+        self.stations_panel.show()
+
+
+if __name__ == "__main__":
+    RadioBarApp().run()

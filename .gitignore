@@ -1,0 +1,6 @@
+build/
+dist/
+dmg-staging/
+*.dmg
+*.spec
+__pycache__/
