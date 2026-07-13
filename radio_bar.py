@@ -346,7 +346,8 @@ class RadioBarApp(rumps.App):
         self.player = None
         self.current_station = None
         self.paused = False
-        self.meta_timer = None
+        self.meta_stop = None
+        self._title_attrs = None
         self._nts_cache = {"time": 0.0, "label": None}
         self._icy_cache = {"time": 0.0, "label": None}
         self.marquee_prefix = "RadioBar"   # static: play state + station name
@@ -432,12 +433,14 @@ class RadioBarApp(rumps.App):
         if playing:
             text = text.ljust(MARQUEE_WIDTH)  # constant char count while playing
         try:
-            # Monospaced font keeps the sliding window a truly fixed width.
-            font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(
-                13, AppKit.NSFontWeightRegular
-            )
+            if self._title_attrs is None:
+                # Monospaced font keeps the sliding window a truly fixed width.
+                font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(
+                    13, AppKit.NSFontWeightRegular
+                )
+                self._title_attrs = {AppKit.NSFontAttributeName: font}
             attributed = AppKit.NSAttributedString.alloc().initWithString_attributes_(
-                text, {AppKit.NSFontAttributeName: font}
+                text, self._title_attrs
             )
             statusitem = self._nsapp.nsstatusitem
             button = statusitem.button()
@@ -447,7 +450,7 @@ class RadioBarApp(rumps.App):
                 if self._fixed_length is None:
                     # Measure the widest possible window once; +10 for padding.
                     sample = AppKit.NSAttributedString.alloc().initWithString_attributes_(
-                        "M" * MARQUEE_WIDTH, {AppKit.NSFontAttributeName: font}
+                        "M" * MARQUEE_WIDTH, self._title_attrs
                     )
                     self._fixed_length = sample.size().width + 10
                 statusitem.setLength_(self._fixed_length)
@@ -528,14 +531,27 @@ class RadioBarApp(rumps.App):
 
     def _start_meta_polling(self):
         self._stop_meta_polling()
-        self._poll_meta()
+        self.meta_stop = threading.Event()
+        thread = threading.Thread(
+            target=self._meta_loop, args=(self.meta_stop,), daemon=True
+        )
+        thread.start()
 
     def _stop_meta_polling(self):
-        if self.meta_timer:
-            self.meta_timer.cancel()
-            self.meta_timer = None
+        if self.meta_stop:
+            self.meta_stop.set()
+            self.meta_stop = None
 
-    def _poll_meta(self):
+    def _meta_loop(self, stop):
+        # One long-lived thread; each cycle gets its own autorelease pool so
+        # ObjC objects created off the main thread are actually freed.
+        while True:
+            with objc.autorelease_pool():
+                self._poll_meta_once()
+            if stop.wait(10.0):
+                return
+
+    def _poll_meta_once(self):
         if not self.player:
             return
         label = self._nts_label()
@@ -544,10 +560,6 @@ class RadioBarApp(rumps.App):
         self._now_label = label
         self.now_playing_item.title = f"♫  {label}" if label else "♫  Playing"
         self._update_marquee_from_state()
-
-        self.meta_timer = threading.Timer(10.0, self._poll_meta)
-        self.meta_timer.daemon = True
-        self.meta_timer.start()
 
     def _nts_label(self):
         """Current NTS show title if playing an NTS live channel, else None."""
