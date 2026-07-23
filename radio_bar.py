@@ -529,8 +529,7 @@ class RadioBarApp(rumps.App):
         self._title_attrs = None
         self._nts_cache = {"time": 0.0, "label": None}
         self._icy_cache = {"time": 0.0, "label": None}
-        self.marquee_prefix = "RadioBar"   # static: play state + station name
-        self.marquee_scroll = ""        # scrolling: current show/track title
+        self.marquee_text = "RadioBar"  # full title; scrolls only if wider than the cap
         self.marquee_offset = 0
         self.marquee_timer = rumps.Timer(self._tick_marquee, MARQUEE_STEP_SECS)
         self._fixed_length = None  # pixel width of the playing-state status item
@@ -567,28 +566,27 @@ class RadioBarApp(rumps.App):
 
     def _update_marquee_from_state(self):
         if not self.current_station:
-            prefix, scroll = "RadioBar", ""
+            full = "RadioBar"
         else:
             # ︎ forces text (not emoji) glyphs so both icons render same-width
             icon = "⏸︎" if self.paused else "▶︎"
-            prefix = f"{icon} {self.current_station['name']}"
-            scroll = self._now_label or ""
-            if scroll:
-                prefix += " · "
+            full = f"{icon} {self.current_station['name']}"
+            if self._now_label:
+                full += f" · {self._now_label}"
         # May be called from the metadata poll thread; timer + AppKit need main.
         AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(
-            lambda: self._set_marquee(prefix, scroll)
+            lambda: self._set_marquee(full)
         )
 
     # ── Menubar title marquee ──────────────────────────────────────────────
 
-    def _set_marquee(self, prefix, scroll):
-        """Set the menubar text; only the scroll part slides, prefix stays put."""
-        if (prefix, scroll) != (self.marquee_prefix, self.marquee_scroll):
-            self.marquee_prefix = prefix
-            self.marquee_scroll = scroll
+    def _set_marquee(self, text):
+        """Set the menubar title. It scrolls only when wider than MARQUEE_WIDTH;
+        otherwise it's shown at its natural width (no padding, no empty space)."""
+        if text != self.marquee_text:
+            self.marquee_text = text
             self.marquee_offset = 0
-        if len(scroll) > self._scroll_width():
+        if len(text) > MARQUEE_WIDTH:
             if not self.marquee_timer.is_alive():
                 self.marquee_timer.start()
         else:
@@ -596,21 +594,16 @@ class RadioBarApp(rumps.App):
                 self.marquee_timer.stop()
         self._render_title()
 
-    def _scroll_width(self):
-        """Characters left for the scrolling title after the static prefix."""
-        return max(6, MARQUEE_WIDTH - len(self.marquee_prefix))
-
     def _tick_marquee(self, _timer):
         self.marquee_offset += 1
         self._render_title()
 
     def _render_title(self):
-        text = self.marquee_prefix + marquee_window(
-            self.marquee_scroll, self.marquee_offset, self._scroll_width()
-        )
-        playing = self.current_station is not None
-        if playing:
-            text = text.ljust(MARQUEE_WIDTH)  # constant char count while playing
+        scrolling = len(self.marquee_text) > MARQUEE_WIDTH
+        if scrolling:
+            text = marquee_window(self.marquee_text, self.marquee_offset, MARQUEE_WIDTH)
+        else:
+            text = self.marquee_text
         try:
             if self._title_attrs is None:
                 # Monospaced font keeps the sliding window a truly fixed width.
@@ -625,15 +618,17 @@ class RadioBarApp(rumps.App):
             button = statusitem.button()
             button.setAlignment_(AppKit.NSTextAlignmentLeft)
             button.setAttributedTitle_(attributed)
-            if playing:
+            if scrolling:
+                # Pin the item to the window width so scrolling text doesn't
+                # resize the item or nudge neighbouring menu bar icons.
                 if self._fixed_length is None:
-                    # Measure the widest possible window once; +10 for padding.
                     sample = AppKit.NSAttributedString.alloc().initWithString_attributes_(
                         "M" * MARQUEE_WIDTH, self._title_attrs
                     )
                     self._fixed_length = sample.size().width + 10
                 statusitem.setLength_(self._fixed_length)
             else:
+                # Short titles: fit content exactly — no trailing empty space.
                 statusitem.setLength_(AppKit.NSVariableStatusItemLength)
         except Exception:
             self.title = text  # fallback: plain proportional title
