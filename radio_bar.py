@@ -800,6 +800,29 @@ if __name__ == "__main__":
         hits = out.get("hits")
         sys.stderr.write(f"SELFTEST search -> {len(hits) if hits else 'FAILED'}\n")
         raise SystemExit(0 if hits else 1)
+    if os.environ.get("RADIOBAR_PLAYTEST"):
+        # Muted playback probe: report whether AVPlayer can load a URL (proves
+        # whether ATS blocks http:// streams inside the bundle). Exits when done.
+        import sys, Foundation
+        url = os.environ["RADIOBAR_PLAYTEST"]
+        player = AVFoundation.AVPlayer.playerWithURL_(
+            Foundation.NSURL.URLWithString_(url))
+        player.setVolume_(0.0)
+        player.play()
+        rl = Foundation.NSRunLoop.currentRunLoop()
+        verdict = "TIMEOUT"
+        for _ in range(30):
+            rl.runMode_beforeDate_(Foundation.NSDefaultRunLoopMode,
+                                   Foundation.NSDate.dateWithTimeIntervalSinceNow_(0.5))
+            item = player.currentItem()
+            if item is None:
+                continue
+            if item.status() == 1:      # ReadyToPlay
+                verdict = "PLAYS"; break
+            if item.status() == 2:      # Failed
+                verdict = f"FAILED: {item.error().localizedDescription()}"; break
+        sys.stderr.write(f"PLAYTEST {url} -> {verdict}\n")
+        raise SystemExit(0 if verdict == "PLAYS" else 1)
     if not acquire_single_instance():
         # Another RadioBar is already running — quietly step aside.
         raise SystemExit(0)

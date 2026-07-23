@@ -7,7 +7,7 @@
 # The .venv312 virtualenv below pins the interpreter.
 set -euo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 PY=.venv312/bin/python
 
 # One-time setup: python3.12 -m venv .venv312 && \
@@ -18,10 +18,16 @@ rm -rf build dist dmg-staging
     --osx-bundle-identifier pl.jeremiasz.radiobar radio_bar.py
 
 # Menubar-only app: no Dock icon, no Cmd-Tab entry; label the version
-/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" \
-    dist/RadioBar.app/Contents/Info.plist
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" \
-    dist/RadioBar.app/Contents/Info.plist
+PL=dist/RadioBar.app/Contents/Info.plist
+/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PL"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$PL"
+
+# Allow http:// radio streams. macOS App Transport Security blocks non-TLS
+# connections by default, which silently breaks the many http-only stations
+# in the Radio Browser directory (AVPlayer just reports the item as failed).
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PL"
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PL"
+
 codesign --force --deep -s - dist/RadioBar.app
 
 mkdir dmg-staging
