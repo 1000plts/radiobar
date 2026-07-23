@@ -12,7 +12,7 @@ import ssl
 import threading
 import time
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import rumps
 import objc
 import AppKit
@@ -144,6 +144,48 @@ def fetch_nts_now(channel):
     return None
 
 
+RADIO_BROWSER_MIRRORS = [
+    "https://de1.api.radio-browser.info",
+    "https://de2.api.radio-browser.info",
+]
+
+
+def search_radio_browser(term, limit=15):
+    """Search the open Radio Browser directory (community station index).
+
+    Returns a list of {"name", "url", "detail"} dicts sorted by votes,
+    or None if every mirror failed. Tries each mirror twice — the servers
+    occasionally return transient 503s.
+    """
+    query = quote(term)
+    for base in RADIO_BROWSER_MIRRORS * 2:
+        try:
+            request = urllib.request.Request(
+                f"{base}/json/stations/search?name={query}&limit={limit}"
+                "&order=votes&reverse=true&hidebroken=true",
+                headers={"User-Agent": "RadioBar/1.0 (github.com/1000plts/radiobar)"},
+            )
+            with urllib.request.urlopen(request, timeout=6) as resp:
+                data = json.load(resp)
+            results = []
+            for s in data:
+                url = (s.get("url_resolved") or s.get("url") or "").strip()
+                name = (s.get("name") or "").strip()
+                if not url or not name:
+                    continue
+                bitrate = s.get("bitrate") or 0
+                detail = " · ".join(x for x in (
+                    s.get("countrycode") or s.get("country") or "",
+                    s.get("codec") or "",
+                    f"{bitrate} kbps" if bitrate else "",
+                ) if x)
+                results.append({"name": name, "url": url, "detail": detail})
+            return results
+        except Exception:
+            continue
+    return None
+
+
 class StationsPanelController(AppKit.NSObject):
     """Native 'Manage Stations' panel: station list, − to remove, fields + Add."""
 
@@ -153,7 +195,9 @@ class StationsPanelController(AppKit.NSObject):
             return None
         self.app = app
         self.panel = None
-        return self
+        self.results = []
+        self.results_table = None  # created in _build_panel; datasource callbacks
+        return self                # can fire before it exists
 
     def show(self):
         if self.panel is None:
@@ -168,7 +212,7 @@ class StationsPanelController(AppKit.NSObject):
     def _build_panel(self):
         style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable
         self.panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            AppKit.NSMakeRect(0, 0, 460, 340), style, AppKit.NSBackingStoreBuffered, False
+            AppKit.NSMakeRect(0, 0, 460, 560), style, AppKit.NSBackingStoreBuffered, False
         )
         self.panel.setTitle_("Manage Stations")
         self.panel.setFloatingPanel_(True)
@@ -187,21 +231,73 @@ class StationsPanelController(AppKit.NSObject):
         self.table.registerForDraggedTypes_([STATION_ROW_TYPE])
         self.table.setDraggingSourceOperationMask_forLocal_(AppKit.NSDragOperationMove, True)
 
-        scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(20, 116, 420, 204))
+        scroll = AppKit.NSScrollView.alloc().initWithFrame_(AppKit.NSMakeRect(20, 336, 420, 204))
         scroll.setDocumentView_(self.table)
         scroll.setHasVerticalScroller_(True)
         scroll.setBorderType_(AppKit.NSBezelBorder)
         content.addSubview_(scroll)
 
         minus = AppKit.NSButton.buttonWithTitle_target_action_("−", self, "removeClicked:")
-        minus.setFrame_(AppKit.NSMakeRect(20, 84, 32, 24))
+        minus.setFrame_(AppKit.NSMakeRect(20, 304, 32, 24))
         content.addSubview_(minus)
 
         self.count_label = AppKit.NSTextField.labelWithString_("")
-        self.count_label.setFrame_(AppKit.NSMakeRect(300, 88, 140, 17))
+        self.count_label.setFrame_(AppKit.NSMakeRect(300, 308, 140, 17))
         self.count_label.setAlignment_(AppKit.NSTextAlignmentRight)
         self.count_label.setTextColor_(AppKit.NSColor.secondaryLabelColor())
         content.addSubview_(self.count_label)
+
+        # ── Radio Browser directory search ─────────────────────────────────
+        directory_label = AppKit.NSTextField.labelWithString_("Add from directory:")
+        directory_label.setFrame_(AppKit.NSMakeRect(20, 274, 200, 17))
+        content.addSubview_(directory_label)
+
+        self.search_field = AppKit.NSTextField.alloc().initWithFrame_(
+            AppKit.NSMakeRect(20, 240, 328, 24)
+        )
+        self.search_field.setPlaceholderString_("Search 50,000+ stations (Radio Browser)…")
+        self.search_field.setTarget_(self)
+        self.search_field.setAction_("searchClicked:")  # Return key searches
+        content.addSubview_(self.search_field)
+
+        search_button = AppKit.NSButton.buttonWithTitle_target_action_(
+            "Search", self, "searchClicked:"
+        )
+        search_button.setFrame_(AppKit.NSMakeRect(354, 236, 86, 32))
+        content.addSubview_(search_button)
+
+        self.results_table = AppKit.NSTableView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(0, 0, 420, 118)
+        )
+        for identifier, title, width in (("rname", "Station", 190), ("rdetail", "Details", 210)):
+            col = AppKit.NSTableColumn.alloc().initWithIdentifier_(identifier)
+            col.setTitle_(title)
+            col.setWidth_(width)
+            col.setEditable_(False)
+            self.results_table.addTableColumn_(col)
+        self.results_table.setDataSource_(self)
+        self.results_table.setAllowsMultipleSelection_(False)
+        self.results_table.setTarget_(self)
+        self.results_table.setDoubleAction_("addSelectedResult:")
+        results_scroll = AppKit.NSScrollView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(20, 112, 420, 118)
+        )
+        results_scroll.setDocumentView_(self.results_table)
+        results_scroll.setHasVerticalScroller_(True)
+        results_scroll.setBorderType_(AppKit.NSBezelBorder)
+        content.addSubview_(results_scroll)
+
+        add_selected = AppKit.NSButton.buttonWithTitle_target_action_(
+            "+ Add Selected", self, "addSelectedResult:"
+        )
+        add_selected.setFrame_(AppKit.NSMakeRect(20, 74, 130, 28))
+        content.addSubview_(add_selected)
+
+        self.search_status = AppKit.NSTextField.labelWithString_("")
+        self.search_status.setFrame_(AppKit.NSMakeRect(240, 80, 200, 17))
+        self.search_status.setAlignment_(AppKit.NSTextAlignmentRight)
+        self.search_status.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+        content.addSubview_(self.search_status)
 
         self.name_field = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(20, 40, 140, 24))
         self.name_field.setPlaceholderString_("Name")
@@ -274,15 +370,69 @@ class StationsPanelController(AppKit.NSObject):
     # ── NSTableView data source ────────────────────────────────────────────
 
     def numberOfRowsInTableView_(self, table):
+        if table is self.results_table:
+            return len(self.results)
         return len(self._stations())
 
     def tableView_objectValueForTableColumn_row_(self, table, column, row):
+        if table is self.results_table:
+            result = self.results[row]
+            return result["name"] if column.identifier() == "rname" else result["detail"]
         station = self._stations()[row]
         return station["name"] if column.identifier() == "name" else station["url"]
+
+    # ── Directory search ───────────────────────────────────────────────────
+
+    def searchClicked_(self, sender):
+        term = self.search_field.stringValue().strip()
+        if not term:
+            return
+        self.search_status.setStringValue_("Searching…")
+        threading.Thread(target=self._run_search, args=(term,), daemon=True).start()
+
+    def _run_search(self, term):
+        with objc.autorelease_pool():
+            results = search_radio_browser(term)
+            AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._apply_results(results)
+            )
+
+    def _apply_results(self, results):
+        if results is None:
+            self.results = []
+            self.search_status.setStringValue_("Search failed — try again")
+        else:
+            self.results = results
+            self.search_status.setStringValue_(
+                f"{len(results)} found" if results else "No results"
+            )
+        self.results_table.reloadData()
+
+    def addSelectedResult_(self, sender):
+        row = self.results_table.selectedRow()
+        if row < 0:
+            row = self.results_table.clickedRow()
+        if row < 0 or row >= len(self.results):
+            AppKit.NSBeep()
+            return
+        if len(self._stations()) >= MAX_STATIONS:
+            AppKit.NSBeep()
+            self.search_status.setStringValue_("Max 10 stations — remove one first")
+            return
+        result = self.results[row]
+        stations = self._stations()
+        stations.append({"name": result["name"], "url": result["url"]})
+        self.app.config["stations"] = stations
+        save_config(self.app.config)
+        self.app._build_menu()
+        self._reload()
+        self.search_status.setStringValue_(f"Added: {result['name']}")
 
     # ── Drag-and-drop reordering ───────────────────────────────────────────
 
     def tableView_pasteboardWriterForRow_(self, table, row):
+        if table is not self.table:
+            return None  # search results are not draggable
         item = AppKit.NSPasteboardItem.alloc().init()
         item.setString_forType_(str(row), STATION_ROW_TYPE)
         return item
