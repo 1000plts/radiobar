@@ -5,6 +5,7 @@ Requires: rumps, pyobjc (AppKit + AVFoundation). Audio plays via AVPlayer —
 no external apps needed.
 """
 
+import fcntl
 import json
 import os
 import socket
@@ -740,5 +741,27 @@ class RadioBarApp(rumps.App):
         self.stations_panel.show()
 
 
+_instance_lock = None
+
+
+def acquire_single_instance():
+    """Hold an exclusive lock so only one RadioBar runs, however it's launched.
+
+    The lock is a file in the home dir; flock is released automatically when
+    this process exits. The fd is kept in a module global so it isn't closed
+    (and the lock dropped) by garbage collection.
+    """
+    global _instance_lock
+    _instance_lock = open(os.path.expanduser("~/.radio_bar.lock"), "w")
+    try:
+        fcntl.flock(_instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
+    if not acquire_single_instance():
+        # Another RadioBar is already running — quietly step aside.
+        raise SystemExit(0)
     RadioBarApp().run()

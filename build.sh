@@ -2,7 +2,7 @@
 # Build RadioBar.app and RadioBar-<version>.dmg
 set -euo pipefail
 
-VERSION="1.1"
+VERSION="1.1.1"
 
 rm -rf build dist dmg-staging
 python3 -m PyInstaller --noconfirm --windowed --name RadioBar \
