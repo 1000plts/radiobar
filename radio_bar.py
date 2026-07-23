@@ -19,6 +19,36 @@ import objc
 import AppKit
 import AVFoundation
 
+# In a bundled .app the system CA certs aren't on the default search path, so
+# every HTTPS request (station search, NTS metadata) fails cert verification.
+# Point OpenSSL at certifi's bundle so urllib/ssl can verify certificates.
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("SSL_CERT_DIR", os.path.dirname(certifi.where()))
+except Exception:
+    certifi = None
+
+
+# Python 3.14's stack-overflow guard trips the recursive json decoder on the
+# small C stack PyInstaller gives worker threads ("Stack overflow (used 17 kB)").
+# Give every new thread a generous stack so json.load of API responses is safe.
+try:
+    threading.stack_size(16 * 1024 * 1024)
+except (ValueError, RuntimeError):
+    pass
+
+
+def https_context():
+    """SSL context that verifies against certifi's CA bundle when available.
+
+    A bundled .app has no system CA certs on the default path, so the default
+    context can't verify anything; certifi supplies a known-good bundle.
+    """
+    if certifi is not None:
+        return ssl.create_default_context(cafile=certifi.where())
+    return ssl.create_default_context()
+
 CONFIG_PATH = os.path.expanduser("~/.radio_bar_config.json")
 
 DEFAULT_STATIONS = [
@@ -96,9 +126,7 @@ def fetch_icy_title(url, timeout=6):
         sock = socket.create_connection((host, port), timeout=timeout)
         try:
             if parts.scheme == "https":
-                sock = ssl.create_default_context().wrap_socket(
-                    sock, server_hostname=host
-                )
+                sock = https_context().wrap_socket(sock, server_hostname=host)
             request = (
                 f"GET {path} HTTP/1.0\r\nHost: {host}\r\n"
                 "Icy-MetaData: 1\r\nUser-Agent: RadioBar\r\n\r\n"
@@ -134,7 +162,7 @@ def fetch_icy_title(url, timeout=6):
 def fetch_nts_now(channel):
     """Fetch the current broadcast title for an NTS channel. Returns str or None."""
     try:
-        with urllib.request.urlopen(NTS_LIVE_API, timeout=5) as resp:
+        with urllib.request.urlopen(NTS_LIVE_API, timeout=5, context=https_context()) as resp:
             data = json.load(resp)
         for ch in data.get("results", []):
             if str(ch.get("channel_name")) == channel:
@@ -166,7 +194,7 @@ def search_radio_browser(term, limit=15):
                 "&order=votes&reverse=true&hidebroken=true",
                 headers={"User-Agent": "RadioBar/1.0 (github.com/1000plts/radiobar)"},
             )
-            with urllib.request.urlopen(request, timeout=6) as resp:
+            with urllib.request.urlopen(request, timeout=6, context=https_context()) as resp:
                 data = json.load(resp)
             results = []
             for s in data:
@@ -761,6 +789,17 @@ def acquire_single_instance():
 
 
 if __name__ == "__main__":
+    if os.environ.get("RADIOBAR_SELFTEST") == "1":
+        # Frozen-build smoke test: does an HTTPS directory search work end to end
+        # (SSL certs + JSON parse) on a worker thread, as the app runs it?
+        import sys
+        out = {}
+        t = threading.Thread(target=lambda: out.__setitem__("hits", search_radio_browser("bbc")))
+        t.start()
+        t.join()
+        hits = out.get("hits")
+        sys.stderr.write(f"SELFTEST search -> {len(hits) if hits else 'FAILED'}\n")
+        raise SystemExit(0 if hits else 1)
     if not acquire_single_instance():
         # Another RadioBar is already running — quietly step aside.
         raise SystemExit(0)

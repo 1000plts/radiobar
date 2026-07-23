@@ -4,3 +4,4 @@ dmg-staging/
 *.dmg
 *.spec
 __pycache__/
+.venv312/
