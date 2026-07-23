@@ -7,7 +7,7 @@
 # The .venv312 virtualenv below pins the interpreter.
 set -euo pipefail
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 PY=.venv312/bin/python
 
 # One-time setup: python3.12 -m venv .venv312 && \

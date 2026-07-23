@@ -79,7 +79,7 @@ def save_config(config):
         json.dump(config, f, indent=2)
 
 
-MAX_STATIONS = 10
+MAX_STATIONS = 20
 STATION_ROW_TYPE = "com.radiobar.station-row"  # pasteboard type for drag-reorder
 
 MARQUEE_WIDTH = 24      # visible characters in the menubar title
@@ -446,7 +446,7 @@ class StationsPanelController(AppKit.NSObject):
             return
         if len(self._stations()) >= MAX_STATIONS:
             AppKit.NSBeep()
-            self.search_status.setStringValue_("Max 10 stations — remove one first")
+            self.search_status.setStringValue_(f"Max {MAX_STATIONS} stations — remove one first")
             return
         result = self.results[row]
         stations = self._stations()
@@ -642,7 +642,7 @@ class RadioBarApp(rumps.App):
 
     def _build_menu(self):
         self.menu.clear()
-        stations = self.config.get("stations", [])[:10]
+        stations = self.config.get("stations", [])[:MAX_STATIONS]
 
         self.now_playing_item = rumps.MenuItem("—", callback=None)
         self.menu.add(self.now_playing_item)
