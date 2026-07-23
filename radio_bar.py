@@ -731,6 +731,15 @@ class RadioBarApp(rumps.App):
         label = self._nts_label()
         if label is None:
             label = self._icy_label()
+        # Touch AppKit (menu item + status title) only on the main thread —
+        # mutating a menu item's title off-thread crashes an open menu.
+        AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(
+            lambda: self._apply_now_playing(label)
+        )
+
+    def _apply_now_playing(self, label):
+        if not self.player:
+            return
         self._now_label = label
         self.now_playing_item.title = f"♫  {label}" if label else "♫  Playing"
         self._update_marquee_from_state()
