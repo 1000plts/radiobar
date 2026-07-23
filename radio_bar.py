@@ -529,7 +529,8 @@ class RadioBarApp(rumps.App):
         self._title_attrs = None
         self._nts_cache = {"time": 0.0, "label": None}
         self._icy_cache = {"time": 0.0, "label": None}
-        self.marquee_text = "RadioBar"  # full title; scrolls only if wider than the cap
+        self.marquee_prefix = ""        # pinned, always shown (play/pause icon)
+        self.marquee_body = "RadioBar"  # scrolls after the prefix if too long
         self.marquee_offset = 0
         self.marquee_timer = rumps.Timer(self._tick_marquee, MARQUEE_STEP_SECS)
         self._fixed_length = None  # pixel width of the playing-state status item
@@ -566,27 +567,31 @@ class RadioBarApp(rumps.App):
 
     def _update_marquee_from_state(self):
         if not self.current_station:
-            full = "RadioBar"
+            prefix, body = "", "RadioBar"
         else:
-            # ︎ forces text (not emoji) glyphs so both icons render same-width
+            # ︎ forces text (not emoji) glyphs so both icons render same-width.
+            # The icon is a pinned prefix so it stays visible while body scrolls.
             icon = "⏸︎" if self.paused else "▶︎"
-            full = f"{icon} {self.current_station['name']}"
+            prefix = f"{icon} "
+            body = self.current_station["name"]
             if self._now_label:
-                full += f" · {self._now_label}"
+                body += f" · {self._now_label}"
         # May be called from the metadata poll thread; timer + AppKit need main.
         AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(
-            lambda: self._set_marquee(full)
+            lambda: self._set_marquee(prefix, body)
         )
 
     # ── Menubar title marquee ──────────────────────────────────────────────
 
-    def _set_marquee(self, text):
-        """Set the menubar title. It scrolls only when wider than MARQUEE_WIDTH;
-        otherwise it's shown at its natural width (no padding, no empty space)."""
-        if text != self.marquee_text:
-            self.marquee_text = text
+    def _set_marquee(self, prefix, body):
+        """Set the menubar title. The prefix (play/pause icon) is always shown;
+        the body scrolls only when it's wider than the remaining width, else the
+        title sits at its natural width (no padding, no empty space)."""
+        if (prefix, body) != (self.marquee_prefix, self.marquee_body):
+            self.marquee_prefix = prefix
+            self.marquee_body = body
             self.marquee_offset = 0
-        if len(text) > MARQUEE_WIDTH:
+        if len(body) > self._body_width():
             if not self.marquee_timer.is_alive():
                 self.marquee_timer.start()
         else:
@@ -594,16 +599,21 @@ class RadioBarApp(rumps.App):
                 self.marquee_timer.stop()
         self._render_title()
 
+    def _body_width(self):
+        """Characters available for the scrolling body after the pinned prefix."""
+        return max(6, MARQUEE_WIDTH - len(self.marquee_prefix))
+
     def _tick_marquee(self, _timer):
         self.marquee_offset += 1
         self._render_title()
 
     def _render_title(self):
-        scrolling = len(self.marquee_text) > MARQUEE_WIDTH
+        scrolling = len(self.marquee_body) > self._body_width()
         if scrolling:
-            text = marquee_window(self.marquee_text, self.marquee_offset, MARQUEE_WIDTH)
+            body = marquee_window(self.marquee_body, self.marquee_offset, self._body_width())
         else:
-            text = self.marquee_text
+            body = self.marquee_body
+        text = self.marquee_prefix + body
         try:
             if self._title_attrs is None:
                 # Monospaced font keeps the sliding window a truly fixed width.
